@@ -106,6 +106,9 @@ class KSSTTSDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
+        # 입력 길이를 기준으로 내림차순 정렬
+        batch = sorted(batch, key=lambda x: len(x['text']), reverse=True)
+        
         # 텍스트 패딩
         input_lengths = torch.LongTensor([len(x['text']) for x in batch])
         max_input_len = input_lengths.max().item()
