@@ -72,16 +72,41 @@ class TTSLoss(nn.Module):
 
     def mel_spectrogram_loss(self, real_wave, fake_wave):
         """Mel-spectrogram L1 Loss"""
+        # 더 작은 길이에 맞추기
+        min_length = min(real_wave.size(-1), fake_wave.size(-1))
+        real_wave = real_wave[..., :min_length]
+        fake_wave = fake_wave[..., :min_length]
+        
+        # Mel spectrogram 생성
         real_mel = self.mel_transform(real_wave)
         fake_mel = self.mel_transform(fake_wave)
+        
+        # 디버깅을 위한 shape 출력
+        print(f"Real wave shape: {real_wave.shape}")
+        print(f"Fake wave shape: {fake_wave.shape}")
+        print(f"Real mel shape: {real_mel.shape}")
+        print(f"Fake mel shape: {fake_mel.shape}")
+        
         return self.l1_loss(fake_mel, real_mel) * self.lambda_mel
 
     def feature_matching_loss(self, fmap_r, fmap_g):
         loss = 0
         for dr, dg in zip(fmap_r, fmap_g):
             for rl, gl in zip(dr, dg):
-                loss += torch.mean(torch.abs(rl - gl))
-        return loss * 2
+                if isinstance(rl, torch.Tensor) and isinstance(gl, torch.Tensor):
+                    # 더 작은 크기에 맞추기
+                    if rl.dim() == gl.dim():
+                        min_length = min(rl.size(-1), gl.size(-1))
+                        if rl.dim() == 3:  # MSD features
+                            rl = rl[..., :min_length]
+                            gl = gl[..., :min_length]
+                        elif rl.dim() == 4:  # MPD features
+                            rl = rl[..., :min_length, :]
+                            gl = gl[..., :min_length, :]
+                        
+                        loss += torch.mean(torch.abs(rl - gl))
+        
+        return loss * self.lambda_fm
 
     def generator_loss(self, disc_outputs):
         loss = 0
@@ -99,19 +124,25 @@ class TTSLoss(nn.Module):
 
     def hifi_gan_loss(self, real_wave, fake_wave, real_outputs, fake_outputs, real_feats, fake_feats):
         """HiFi-GAN Total Loss Calculation"""
-        # real_wave와 fake_wave의 차원 확인 및 조정
+        # 차원 확인 및 조정
         if real_wave.dim() == 2:
             real_wave = real_wave.unsqueeze(1)
         if fake_wave.dim() == 2:
             fake_wave = fake_wave.unsqueeze(1)
         
-        # 1. Mel-spectrogram Loss
+        # 길이 맞추기
+        min_length = min(real_wave.size(-1), fake_wave.size(-1))
+        real_wave = real_wave[..., :min_length]
+        fake_wave = fake_wave[..., :min_length]
+        
+        # 디버깅을 위한 shape 출력
+        print(f"\nFeature matching shapes:")
+        print(f"Real features length: {[[(f.shape) for f in disc] for disc in real_feats]}")
+        print(f"Fake features length: {[[(f.shape) for f in disc] for disc in fake_feats]}")
+        
+        # Loss 계산
         mel_loss = self.mel_spectrogram_loss(real_wave, fake_wave)
-        
-        # 2. Feature Matching Loss
         fm_loss = self.feature_matching_loss(real_feats, fake_feats)
-        
-        # 3. Adversarial Losses
         gen_loss = self.generator_loss(fake_outputs)
         disc_loss = self.discriminator_loss(real_outputs, fake_outputs)
         

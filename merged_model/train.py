@@ -59,19 +59,16 @@ class Trainer:
         self.criterion = TTSLoss(device=self.device)
         
         # Optimizer 초기화
-        self.optimizer_t2 = optim.Adam(self.tacotron2.parameters(), lr=config.learning_rate, weight_decay=1e-6)
-        self.optimizer_g = optim.Adam(self.generator.parameters(), 
-                                    lr=config.learning_rate,
-                                    weight_decay=1e-6,
-                                    betas=(0.8, 0.99))
-        self.optimizer_d = optim.Adam(
-            list(self.msd.parameters()) + 
-            list(self.mpd.parameters()) + 
-            list(self.mrf.parameters()),
-            lr=config.learning_rate,
-            weight_decay=1e-6,
-            betas=(0.8, 0.99)
-        )
+        self.optimizer_g = optim.AdamW([
+            {'params': self.tacotron2.parameters()},
+            {'params': self.generator.parameters()}
+        ], lr=config.learning_rate, betas=(0.8, 0.99), weight_decay=0.01)
+        
+        self.optimizer_d = optim.AdamW([
+            {'params': self.msd.parameters()},
+            {'params': self.mpd.parameters()},
+            {'params': self.mrf.parameters()}
+        ], lr=config.learning_rate, betas=(0.8, 0.99), weight_decay=0.01)
         
         # 체크포인트 디렉토리 생성
         self.checkpoint_dir = Path(config.checkpoint_dir)
@@ -110,101 +107,80 @@ class Trainer:
         return checkpoint['epoch']
 
     def train_step(self, batch):
-        # 변수 초기화
-        mel_outputs = None
-        mel_outputs_postnet = None
-        fake_audio = None
-        
         try:
-            # 데이터 로드 및 디바이스 이동
-            text_padded, input_lengths, mel_padded, gate_padded, \
-            output_lengths, audio_padded = [x.to(self.device) for x in batch]
+            # 배치 데이터 언패킹
+            text_padded = batch['text_padded'].to(self.device)
+            mel_padded = batch['mel_padded'].to(self.device)
+            gate_padded = batch['gate_padded'].to(self.device)
+            audio_padded = batch['audio_padded'].to(self.device)
+            text_lengths = batch['text_lengths'].to(self.device)
+            mel_lengths = batch['mel_lengths'].to(self.device)
             
-            # 1. Tacotron2 forward pass
-            mel_outputs, mel_outputs_postnet, gate_outputs, _ = self.tacotron2(
-                text_padded, input_lengths, mel_padded, output_lengths)
+            # 디버깅을 위한 shape 출력
+            print("\nInput shapes:")
+            print(f"text_padded: {text_padded.shape}")
+            print(f"mel_padded: {mel_padded.shape}")
+            print(f"gate_padded: {gate_padded.shape}")
+            print(f"audio_padded: {audio_padded.shape}")
             
-            # mel_outputs의 차원을 확인하고 조정
-            B, T, C = mel_outputs.size()
-            if C != 80:  # n_mel_channels가 80이 아닌 경우
-                mel_outputs = mel_outputs[:, :, :80]
-                mel_outputs_postnet = mel_outputs_postnet[:, :, :80]
+            # Tacotron2 forward
+            mel_outputs_postnet, mel_outputs, gate_outputs, _ = self.tacotron2(
+                text_padded, text_lengths, mel_padded, mel_lengths)
             
-            # Tacotron2 loss 계산
-            t2_losses = self.criterion.tacotron2_loss(
-                mel_outputs, mel_outputs_postnet, gate_outputs,
-                mel_padded, gate_padded, output_lengths
-            )
+            # Generator forward
+            mel_for_generator = mel_outputs_postnet.transpose(1, 2)
+            fake_audio = self.generator(mel_for_generator)
             
-            # 2. Generator forward pass
-            mel_outputs_postnet = mel_outputs_postnet.transpose(1, 2)  # [B, T, C] -> [B, C, T]
-            fake_audio = self.generator(mel_outputs_postnet)
-            
-            # 오디오 차원 확인 및 조정
-            if fake_audio.dim() == 2:
-                fake_audio = fake_audio.unsqueeze(1)
-            if audio_padded.dim() == 2:
-                audio_padded = audio_padded.unsqueeze(1)
-            
-            # Discriminator forward passes
+            # Discriminator forward
             msd_real_outputs, msd_real_features = self.msd(audio_padded)
             msd_fake_outputs, msd_fake_features = self.msd(fake_audio.detach())
             
             mpd_real_outputs, mpd_real_features = self.mpd(audio_padded)
             mpd_fake_outputs, mpd_fake_features = self.mpd(fake_audio.detach())
             
-            # MRF Discriminator
-            mrf_output = self.mrf(msd_fake_features, mpd_fake_features)
+            # Loss 계산
+            # Tacotron2 loss
+            tacotron2_losses = self.criterion.tacotron2_loss(
+                mel_outputs, mel_outputs_postnet, gate_outputs,
+                mel_padded, gate_padded, mel_lengths
+            )
             
-            # HiFi-GAN losses
+            # HiFi-GAN loss
+            real_outputs = msd_real_outputs + mpd_real_outputs
+            fake_outputs = msd_fake_outputs + mpd_fake_outputs
+            real_features = msd_real_features + mpd_real_features
+            fake_features = msd_fake_features + mpd_fake_features
+            
             hifigan_losses = self.criterion.hifi_gan_loss(
                 audio_padded, fake_audio,
-                msd_real_outputs + mpd_real_outputs,  # real outputs
-                msd_fake_outputs + mpd_fake_outputs,  # fake outputs
-                msd_real_features + mpd_real_features,  # real features
-                msd_fake_features + mpd_fake_features   # fake features
+                real_outputs, fake_outputs,
+                real_features, fake_features
             )
             
-            # 5. Optimization
-            # Tacotron2
-            self.optimizer_t2.zero_grad()
-            t2_losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(self.tacotron2.parameters(), 1.0)
-            self.optimizer_t2.step()
-            
-            # Generator
+            # Optimizer step
+            # Generator update
             self.optimizer_g.zero_grad()
-            hifigan_losses['generator_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+            g_loss = tacotron2_losses['total_loss'] + hifigan_losses['generator_loss']
+            g_loss.backward(retain_graph=True)
             self.optimizer_g.step()
             
-            # Discriminators
+            # Discriminator update
             self.optimizer_d.zero_grad()
-            hifigan_losses['discriminator_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.msd.parameters()) + 
-                list(self.mpd.parameters()) + 
-                list(self.mrf.parameters()),
-                1.0
-            )
+            d_loss = hifigan_losses['discriminator_loss']
+            d_loss.backward()
             self.optimizer_d.step()
             
-            return {**t2_losses, **hifigan_losses}
+            return {
+                'total_loss': g_loss + d_loss,
+                **tacotron2_losses,
+                **hifigan_losses
+            }
             
         except Exception as e:
             print(f"\nError in train_step: {str(e)}")
-            print("\nShape information:")
-            print(f"text_padded: {text_padded.shape}")
-            print(f"mel_padded: {mel_padded.shape} (expected: [B, n_mel_channels, T])")
-            if mel_outputs is not None:
-                print(f"mel_outputs: {mel_outputs.shape} (expected: [B, T, n_mel_channels])")
-                print(f"gate_outputs: {gate_outputs.shape} (expected: [B, T])")
-            if mel_outputs_postnet is not None:
-                print(f"mel_outputs_postnet: {mel_outputs_postnet.shape} (expected: [B, T, n_mel_channels])")
-            if fake_audio is not None:
-                print(f"fake_audio: {fake_audio.shape}")
-            print(f"audio_padded: {audio_padded.shape}")
-            print(f"gate_padded: {gate_padded.shape} (expected: [B, T])")
+            print("\nBatch information:")
+            print(f"Batch size: {len(batch)}")
+            print(f"Batch contents: {[type(x) for x in batch]}")
             raise e
 
     def train(self):
@@ -242,7 +218,7 @@ if __name__ == '__main__':
     
     config = Namespace(
         device_num=0,
-        batch_size=32,
+        batch_size=4,
         learning_rate=0.0002,
         num_epochs=100,
         start_epoch=0,

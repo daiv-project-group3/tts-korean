@@ -123,44 +123,58 @@ class Encoder(nn.Module):
     def __init__(self, encoder_embedding_dim, encoder_n_convolutions,
                  encoder_kernel_size, encoder_lstm_dim):
         super().__init__()
-
-        # 3개의 conv layers
+        
         convolutions = []
         for _ in range(encoder_n_convolutions):
             conv_layer = nn.Sequential(
-                nn.Conv1d(encoder_embedding_dim,
-                         encoder_embedding_dim,
-                         kernel_size=encoder_kernel_size,
-                         stride=1,
+                nn.Conv1d(encoder_embedding_dim, encoder_embedding_dim,
+                         encoder_kernel_size, stride=1,
                          padding=int((encoder_kernel_size - 1) / 2)),
                 nn.BatchNorm1d(encoder_embedding_dim),
                 nn.ReLU(),
-                nn.Dropout(0.5))
+                nn.Dropout(0.5)
+            )
             convolutions.append(conv_layer)
         self.convolutions = nn.ModuleList(convolutions)
-
-        # Bi-directional LSTM (128 * 2 = 256)
-        self.lstm = nn.LSTM(encoder_embedding_dim,
-                           encoder_lstm_dim,
-                           1,
-                           batch_first=True,
-                           bidirectional=True)
+        
+        self.lstm = nn.LSTM(encoder_embedding_dim, encoder_lstm_dim,
+                           num_layers=1, batch_first=True, bidirectional=True)
 
     def forward(self, x, input_lengths):
+        """
+        x: [B, embed_dim, T]
+        input_lengths: [B]
+        """
+        # Conv layers
         for conv in self.convolutions:
             x = conv(x)
-
-        x = x.transpose(1, 2)
-        input_lengths = input_lengths.cpu().numpy()
-        x = nn.utils.rnn.pack_padded_sequence(
-            x, input_lengths, batch_first=True)
-
+        
+        # Prepare for LSTM
+        x = x.transpose(1, 2)  # [B, T, embed_dim]
+        
+        # Pack sequence
+        input_lengths = input_lengths.cpu()  # lengths를 CPU로 이동
+        
+        # Sort by length for packing
+        input_lengths, sort_idx = torch.sort(input_lengths, descending=True)
+        x = x[sort_idx]
+        
+        # Pack the sequence
+        x_packed = nn.utils.rnn.pack_padded_sequence(
+            x, input_lengths.cpu(), batch_first=True)
+        
+        # LSTM forward
         self.lstm.flatten_parameters()
-        outputs, _ = self.lstm(x)
-
+        outputs, _ = self.lstm(x_packed)
+        
+        # Unpack the sequence
         outputs, _ = nn.utils.rnn.pad_packed_sequence(
             outputs, batch_first=True)
-
+        
+        # Restore original order
+        _, unsort_idx = torch.sort(sort_idx)
+        outputs = outputs[unsort_idx]
+        
         return outputs
 
     def inference(self, x):

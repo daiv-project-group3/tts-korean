@@ -197,36 +197,66 @@ class MultiPeriodDiscriminator(nn.Module):
 class MRFDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
-        # 채널 수를 맞추기 위한 Conv1d 레이어
-        self.channel_adjustment = nn.Conv1d(128, 512, kernel_size=3, padding=1)
+        # 초기 채널 조정을 위한 Conv1d 레이어들
+        self.msd_adjust = nn.Conv1d(1, 64, kernel_size=3, padding=1)
         
-        # ResBlock 추가
-        self.resblock1 = ResBlock(512, 256)
-        self.resblock2 = ResBlock(256, 128)
+        # MPD feature를 위한 2D -> 1D 변환 레이어
+        self.mpd_adjust = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 3), padding=(1, 1)),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(32, 64, kernel_size=(3, 3), padding=(1, 1)),
+            nn.LeakyReLU(0.1)
+        )
         
-        # Fusion layer
-        self.fusion_layer = nn.Conv1d(128, 64, kernel_size=3, padding=1)
-        self.output_layer = nn.Conv1d(64, 1, kernel_size=3, padding=1)
+        # 공통 처리를 위한 레이어들
+        self.shared_conv = nn.Sequential(
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(512, 512, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1)
+        )
+        
+        # 최종 출력을 위한 레이어
+        self.output_layer = nn.Conv1d(512, 1, kernel_size=3, padding=1)
 
     def forward(self, msd_features, mpd_features):
-        # 특성 맵의 시간 차원이 다를 수 있으므로 보간 추가
-        target_length = min(msd_features[-1].size(-1), mpd_features[-1].size(-1))
-        msd_feat = F.interpolate(msd_features[-1], size=target_length, mode='linear')
-        mpd_feat = F.interpolate(mpd_features[-1], size=target_length, mode='linear')
+        """
+        Args:
+            msd_features: List[List[Tensor]] - MultiScaleDiscriminator의 feature maps
+            mpd_features: List[List[Tensor]] - MultiPeriodDiscriminator의 feature maps
+        """
+        # 마지막 레이어의 feature map 사용
+        msd_feat = msd_features[-1][-1]  # [B, 1, T]
+        mpd_feat = mpd_features[-1][-1]  # [B, 1, H, W]
         
-        fused_features = torch.cat([msd_feat, mpd_feat], dim=1)
+        # MPD feature 처리
+        if mpd_feat.dim() == 4:
+            B, C, H, W = mpd_feat.size()
+            # 2D 처리
+            mpd_processed = self.mpd_adjust(mpd_feat)  # [B, 64, H, W]
+            # Flatten H, W 차원
+            mpd_processed = mpd_processed.view(B, 64, -1)  # [B, 64, H*W]
         
-        # 채��� 수를 맞추기 위해 adjustment
-        fused_features = self.channel_adjustment(fused_features)
+        # MSD feature 처리
+        msd_processed = self.msd_adjust(msd_feat)  # [B, 64, T]
         
-        # ResBlock을 통한 특성 추출
-        x = self.resblock1(fused_features)
-        x = self.resblock2(x)
+        # 시간 차원 맞추기
+        target_length = min(msd_processed.size(-1), mpd_processed.size(-1))
+        msd_processed = F.interpolate(msd_processed, size=target_length, mode='linear', align_corners=False)
+        mpd_processed = F.interpolate(mpd_processed, size=target_length, mode='linear', align_corners=False)
         
-        # Fusion layer
-        x = self.fusion_layer(x)
-        x = self.output_layer(x)
-        return x
+        # Feature map 결합
+        combined = torch.cat([msd_processed, mpd_processed], dim=1)  # [B, 128, T]
+        
+        # 공통 처리
+        x = self.shared_conv(combined)
+        
+        # 최종 출력
+        output = self.output_layer(x)
+        
+        return output
 
 class DiscriminatorP(nn.Module):
     def __init__(self, period):

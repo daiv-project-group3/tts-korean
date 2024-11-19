@@ -106,44 +106,44 @@ class KSSTTSDataset(Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        # 입력 길이를 기준으로 내림차순 정렬
-        batch = sorted(batch, key=lambda x: len(x['text']), reverse=True)
-        
         # 텍스트 패딩
-        input_lengths = torch.LongTensor([len(x['text']) for x in batch])
-        max_input_len = input_lengths.max().item()
-        text_padded = torch.LongTensor(len(batch), max_input_len)
-        text_padded.zero_()
-        for i in range(len(batch)):
-            text = batch[i]['text']
-            text_padded[i, :len(text)] = torch.LongTensor(text)
-
-        # 멜스펙트로그램 패딩
-        num_mels = batch[0]['mel'].shape[1]  # mel_channels는 두 번째 차원
-        max_output_len = max([x['mel'].shape[0] for x in batch])  # time_steps는 첫 번째 차원
+        text_lengths = [x['text'].size(0) for x in batch]
+        max_text_len = max(text_lengths)
+        text_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long)
+        for i, x in enumerate(batch):
+            text = x['text']
+            text_padded[i, :len(text)] = text
         
-        mel_padded = torch.FloatTensor(len(batch), num_mels, max_output_len)  # [batch, mel_channels, time_steps]
-        gate_padded = torch.FloatTensor(len(batch), max_output_len)
-        output_lengths = torch.LongTensor(len(batch))
+        # 멜 스펙트로그램 패딩
+        mel_lengths = [x['mel'].size(0) for x in batch]
+        max_mel_len = max(mel_lengths)
+        mel_padded = torch.zeros(len(batch), 80, max_mel_len)
+        for i, x in enumerate(batch):
+            mel = x['mel']
+            mel_padded[i, :, :mel.size(0)] = mel.transpose(0, 1)
         
-        mel_padded.zero_()
-        gate_padded.zero_()
-        
-        for i in range(len(batch)):
-            mel = batch[i]['mel']
-            mel = torch.FloatTensor(mel).transpose(0, 1)  # [time_steps, mel_channels] -> [mel_channels, time_steps]
-            mel_padded[i, :, :mel.shape[1]] = mel
-            gate_padded[i, mel.shape[1]-1:] = 1.0
-            output_lengths[i] = mel.shape[1]
-
         # 오디오 패딩
-        max_audio_len = max([len(x['audio']) for x in batch])
-        audio_padded = torch.FloatTensor(len(batch), max_audio_len)
-        audio_padded.zero_()
+        audio_lengths = [x['audio'].size(0) for x in batch]
+        max_audio_len = max(audio_lengths)
+        audio_padded = torch.zeros(len(batch), 1, max_audio_len)
+        for i, x in enumerate(batch):
+            audio = x['audio']
+            audio_padded[i, 0, :audio.size(0)] = audio
         
-        for i in range(len(batch)):
-            audio = batch[i]['audio']
-            audio_padded[i, :len(audio)] = torch.FloatTensor(audio)
-
-        return (text_padded, input_lengths, mel_padded, gate_padded, 
-                output_lengths, audio_padded) 
+        # gate 패딩 생성
+        gate_padded = torch.zeros(len(batch), max_mel_len)
+        for i, length in enumerate(mel_lengths):
+            gate_padded[i, length-1:] = 1
+        
+        # 길이 정보도 함께 반환
+        text_lengths = torch.LongTensor(text_lengths)
+        mel_lengths = torch.LongTensor(mel_lengths)
+        
+        return {
+            'text_padded': text_padded,
+            'mel_padded': mel_padded,
+            'gate_padded': gate_padded,
+            'audio_padded': audio_padded,
+            'text_lengths': text_lengths,
+            'mel_lengths': mel_lengths
+        }
