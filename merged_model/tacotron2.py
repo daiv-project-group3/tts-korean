@@ -175,19 +175,15 @@ class Encoder(nn.Module):
         return outputs
 
 class Decoder(nn.Module):
-    def __init__(self, n_mel_channels, encoder_embedding_dim, attention_dim,
-                 attention_location_n_filters, attention_location_kernel_size,
-                 attention_rnn_dim, decoder_rnn_dim, prenet_dim,
-                 max_decoder_steps, gate_threshold, p_attention_dropout,
-                 p_decoder_dropout):
+    def __init__(self, n_mel_channels, encoder_embedding_dim,
+                 attention_dim, attention_location_n_filters,
+                 attention_location_kernel_size, attention_rnn_dim,
+                 decoder_rnn_dim, prenet_dim, max_decoder_steps,
+                 gate_threshold, p_attention_dropout, p_decoder_dropout):
         super().__init__()
         
-        # 파라미터 저장
         self.n_mel_channels = n_mel_channels
         self.encoder_embedding_dim = encoder_embedding_dim
-        self.attention_dim = attention_dim
-        self.attention_location_n_filters = attention_location_n_filters
-        self.attention_location_kernel_size = attention_location_kernel_size
         self.attention_rnn_dim = attention_rnn_dim
         self.decoder_rnn_dim = decoder_rnn_dim
         self.prenet_dim = prenet_dim
@@ -195,20 +191,37 @@ class Decoder(nn.Module):
         self.gate_threshold = gate_threshold
         self.p_attention_dropout = p_attention_dropout
         self.p_decoder_dropout = p_decoder_dropout
-        
+
         # Prenet
-        self.prenet = Prenet(
-            n_mel_channels,
-            [prenet_dim, prenet_dim]
-        )
-        
+        self.prenet = Prenet(n_mel_channels, [prenet_dim, prenet_dim])
+
         # Attention RNN
         self.attention_rnn = nn.LSTMCell(
             prenet_dim + encoder_embedding_dim,
-            attention_rnn_dim
-        )
-        
+            attention_rnn_dim)
+
         # Attention Layer
+        self.attention_layer = Attention(
+            attention_rnn_dim, encoder_embedding_dim,
+            attention_dim, attention_location_n_filters,
+            attention_location_kernel_size)
+
+        # Decoder RNN
+        self.decoder_rnn = nn.LSTMCell(
+            attention_rnn_dim + encoder_embedding_dim,
+            decoder_rnn_dim)
+
+        # Linear Projection
+        self.linear_projection = nn.Linear(
+            decoder_rnn_dim + encoder_embedding_dim,
+            n_mel_channels)  # 출력을 n_mel_channels로 수정
+
+        # Gate Layer
+        self.gate_layer = nn.Linear(
+            decoder_rnn_dim + encoder_embedding_dim, 1,
+            bias=True)
+
+        # Attention 관련 레이어 추가
         self.attention_layer = Attention(
             attention_rnn_dim,
             encoder_embedding_dim,
@@ -217,22 +230,18 @@ class Decoder(nn.Module):
             attention_location_kernel_size
         )
         
-        # Decoder RNN
-        self.decoder_rnn = nn.LSTMCell(
-            attention_rnn_dim + encoder_embedding_dim,
-            decoder_rnn_dim
+        # Memory layer 추가
+        self.memory_layer = nn.Linear(
+            encoder_embedding_dim,
+            attention_dim,
+            bias=False
         )
         
-        # Linear Projection
-        self.linear_projection = nn.Linear(
-            decoder_rnn_dim + encoder_embedding_dim,
-            n_mel_channels
-        )
-        
-        # Gate Layer
-        self.gate_layer = nn.Linear(
-            decoder_rnn_dim + encoder_embedding_dim,
-            1
+        # Attention context projection
+        self.attention_projection = nn.Linear(
+            encoder_embedding_dim,
+            decoder_rnn_dim,
+            bias=False
         )
 
     def parse_decoder_inputs(self, decoder_inputs):
@@ -267,24 +276,115 @@ class Decoder(nn.Module):
         return mel_outputs, gate_outputs, alignments
 
     def forward(self, encoder_outputs, decoder_inputs, memory_lengths=None):
-        """ Decoder forward pass for training
         """
-        decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
-        decoder_inputs = self.prenet(decoder_inputs)
+        Args:
+            encoder_outputs: [batch_size, max_time, encoder_embedding_dim]
+            decoder_inputs: [batch_size, n_mel_channels, max_time]
+            memory_lengths: [batch_size]
+        """
+        # decoder_inputs 형태 변환
+        decoder_inputs = decoder_inputs.transpose(1, 2)  # [batch_size, max_time, n_mel_channels]
         
-        # ... 나머지 forward 코드 ...
+        # 초기 상태 초기화
+        batch_size = encoder_outputs.size(0)
+        max_time = decoder_inputs.size(1)
         
+        # 초기 attention context
+        attention_context = torch.zeros(
+            batch_size,
+            self.encoder_embedding_dim
+        ).to(encoder_outputs.device)
+        
+        # 초기 attention hidden states
+        attention_hidden = torch.zeros(
+            batch_size,
+            self.attention_rnn_dim
+        ).to(encoder_outputs.device)
+        
+        attention_cell = torch.zeros(
+            batch_size,
+            self.attention_rnn_dim
+        ).to(encoder_outputs.device)
+        
+        # 초기 decoder states
+        decoder_hidden = torch.zeros(
+            batch_size,
+            self.decoder_rnn_dim
+        ).to(encoder_outputs.device)
+        
+        decoder_cell = torch.zeros(
+            batch_size,
+            self.decoder_rnn_dim
+        ).to(encoder_outputs.device)
+        
+        # 초기 attention weights
+        attention_weights = torch.zeros(
+            batch_size,
+            encoder_outputs.size(1)
+        ).to(encoder_outputs.device)
+        
+        # 출력을 저장할 리스트
+        mel_outputs, gate_outputs, alignments = [], [], []
+        
+        # Memory를 미리 처리
+        processed_memory = self.memory_layer(encoder_outputs)
+        
+        # 각 타임스텝에 대해 처리
+        for i in range(max_time):
+            current_input = decoder_inputs[:, i, :]  # [batch_size, n_mel_channels]
+            current_input = self.prenet(current_input)  # [batch_size, prenet_dim]
+            
+            # Attention RNN
+            cell_input = torch.cat((current_input, attention_context), -1)
+            attention_hidden, attention_cell = self.attention_rnn(
+                cell_input, (attention_hidden, attention_cell))
+            attention_hidden = F.dropout(
+                attention_hidden, self.p_attention_dropout, self.training)
+            
+            # Attention 계산
+            attention_weights_cat = torch.cat(
+                (attention_weights.unsqueeze(1),
+                 attention_weights.unsqueeze(1)),
+                dim=1)
+            attention_context, attention_weights = self.attention_layer(
+                attention_hidden, encoder_outputs,
+                processed_memory, attention_weights_cat,
+                mask=None if memory_lengths is None else ~get_mask_from_lengths(memory_lengths))
+            
+            # Decoder RNN
+            decoder_input = torch.cat((attention_hidden, attention_context), -1)
+            decoder_hidden, decoder_cell = self.decoder_rnn(
+                decoder_input, (decoder_hidden, decoder_cell))
+            decoder_hidden = F.dropout(
+                decoder_hidden, self.p_decoder_dropout, self.training)
+            
+            # Linear projection
+            decoder_hidden_attention = torch.cat(
+                (decoder_hidden, attention_context), dim=1)
+            decoder_output = self.linear_projection(decoder_hidden_attention)
+            gate_prediction = self.gate_layer(decoder_hidden_attention)
+            
+            # 결과 저장
+            mel_outputs.append(decoder_output)
+            gate_outputs.append(gate_prediction)
+            alignments.append(attention_weights)
+        
+        # 리스트를 텐서로 변환
+        mel_outputs = torch.stack(mel_outputs)
+        gate_outputs = torch.stack(gate_outputs)
+        alignments = torch.stack(alignments)
+        
+        # 출력 형식 변환
         mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(
             mel_outputs, gate_outputs, alignments)
-            
+        
         return mel_outputs, gate_outputs, alignments
 
 class Tacotron2(nn.Module):
-    # 고정된 값들을 클래스 변수로 정의
     attention_location_n_filters = 32
     attention_location_kernel_size = 31
     decoder_rnn_dim = 512
-    prenet_dim = 128
+    prenet_dim = 256
     max_decoder_steps = 1000
     gate_threshold = 0.5
     p_attention_dropout = 0.1
@@ -297,10 +397,8 @@ class Tacotron2(nn.Module):
                  attention_rnn_dim, attention_dim):
         super().__init__()
         
-        # 임베딩 레이어 (256차원)
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         
-        # 인코더
         self.encoder = Encoder(
             encoder_embedding_dim=embedding_dim,  # 256
             encoder_n_convolutions=encoder_n_convolutions,
@@ -308,7 +406,6 @@ class Tacotron2(nn.Module):
             encoder_lstm_dim=int(embedding_dim/2)  # 128 (bi-directional = 256)
         )
         
-        # 디코더
         self.decoder = Decoder(
             n_mel_channels=n_mel_channels,
             encoder_embedding_dim=embedding_dim,  # 256
@@ -324,7 +421,6 @@ class Tacotron2(nn.Module):
             p_decoder_dropout=self.p_decoder_dropout
         )
         
-        # 포스트넷
         self.postnet = Postnet(
             n_mel_channels=n_mel_channels,
             postnet_embedding_dim=self.postnet_embedding_dim,
@@ -336,19 +432,20 @@ class Tacotron2(nn.Module):
         """
         텍스트를 멜 스펙트로그램으로 변환
         """
-        # 텍스트 임베딩
         embedded_inputs = self.embedding(text_inputs).transpose(1, 2)
         
-        # 인코더 통과
         encoder_outputs = self.encoder(embedded_inputs, text_lengths)
         
-        # 디코더 통과
         mel_outputs, gate_outputs, alignments = self.decoder(
             encoder_outputs, mel_inputs, text_lengths)
         
-        # 포스트넷 통과
-        mel_outputs_postnet = self.postnet(mel_outputs)
-        mel_outputs_postnet = mel_outputs + mel_outputs_postnet
+        # mel_outputs 차원 변환 (B, T, n_mel_channels) -> (B, n_mel_channels, T)
+        mel_outputs_transpose = mel_outputs.transpose(1, 2)
+        mel_outputs_postnet = self.postnet(mel_outputs_transpose)
+        mel_outputs_postnet = mel_outputs_transpose + mel_outputs_postnet
+        
+        # 결과를 다시 원래 형태로 변환 (B, n_mel_channels, T) -> (B, T, n_mel_channels)
+        mel_outputs_postnet = mel_outputs_postnet.transpose(1, 2)
         
         return mel_outputs_postnet, mel_outputs, gate_outputs, alignments
 
