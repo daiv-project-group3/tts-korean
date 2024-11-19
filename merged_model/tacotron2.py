@@ -235,91 +235,49 @@ class Decoder(nn.Module):
             1
         )
 
-    def forward(self, memory, decoder_inputs, memory_lengths):
-        """ Decoder forward pass for training
-        PARAMS
-        ------
-        memory: Encoder outputs
-        decoder_inputs: Decoder inputs for teacher forcing. i.e. mel-specs
-        memory_lengths: Encoder output lengths for attention masking.
-        RETURNS
-        -------
-        mel_outputs: mel outputs from the decoder
-        gate_outputs: gate outputs from the decoder
-        alignments: sequence of attention weights from the decoder
+    def parse_decoder_inputs(self, decoder_inputs):
+        """ Prepares decoder inputs, i.e. mel outputs
+        Args:
+            decoder_inputs: inputs used for teacher-forced training, i.e. mel-specs
         """
-        decoder_input = self.parse_decoder_inputs(decoder_inputs)
-        decoder_outputs = self.decode(decoder_input, memory, memory_lengths)
-        mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(
-            decoder_outputs)
+        # (B, n_mel_channels, T) -> (B, T, n_mel_channels)
+        decoder_inputs = decoder_inputs.transpose(1, 2)
+        decoder_inputs = decoder_inputs.contiguous()
+        
+        # (B, T, n_mel_channels) -> (T, B, n_mel_channels)
+        decoder_inputs = decoder_inputs.transpose(0, 1)
+        return decoder_inputs
+
+    def parse_decoder_outputs(self, mel_outputs, gate_outputs, alignments):
+        """ Prepares decoder outputs for output
+        Args:
+            mel_outputs: mel outputs from the decoder
+            gate_outputs: gate outputs from the decoder
+            alignments: alignments from the decoder
+        """
+        # (T, B, n_mel_channels) -> (B, T, n_mel_channels)
+        mel_outputs = mel_outputs.transpose(0, 1).contiguous()
+        
+        # (T, B) -> (B, T)
+        gate_outputs = gate_outputs.transpose(0, 1).contiguous()
+        
+        # (T, B, n_text) -> (B, T, n_text)
+        alignments = alignments.transpose(0, 1).contiguous()
 
         return mel_outputs, gate_outputs, alignments
 
-    def decode(self, decoder_input, memory, memory_lengths=None):
+    def forward(self, encoder_outputs, decoder_inputs, memory_lengths=None):
         """ Decoder forward pass for training
-        PARAMS
-        ------
-        decoder_input: list of mel frames
-        memory: Encoder outputs
-        memory_lengths: Encoder output lengths for attention masking.
-        RETURNS
-        -------
-        mel_outputs: mel outputs from the decoder
-        gate_outputs: gate outputs from the decoder
-        alignments: sequence of attention weights from the decoder
         """
-        decoder_input = self.parse_decoder_inputs(decoder_input)
-        decoder_outputs = []
-        attention_weights = []
-        attention_weights_cum = []
-        attention_context = []
-
-        # Initialize decoder states
-        attention_hidden = torch.zeros(
-            decoder_input.size(0), self.attention_rnn_dim, device=decoder_input.device)
-        attention_cell = torch.zeros(
-            decoder_input.size(0), self.attention_rnn_dim, device=decoder_input.device)
-        decoder_hidden = torch.zeros(
-            decoder_input.size(0), self.decoder_rnn_dim, device=decoder_input.device)
-        decoder_cell = torch.zeros(
-            decoder_input.size(0), self.decoder_rnn_dim, device=decoder_input.device)
-        attention_weights = torch.zeros(
-            decoder_input.size(0), memory.size(1), device=decoder_input.device)
-        attention_weights_cum = torch.zeros(
-            decoder_input.size(0), memory.size(1), device=decoder_input.device)
-
-        # Initialize previous context
-        attention_context = torch.zeros(
-            decoder_input.size(0), self.encoder_embedding_dim, device=decoder_input.device)
-
-        # Time first: (batch_size, time_steps, n_mel_channels)
-        processed_memory = self.memory_layer(memory)
-        if memory_lengths is not None:
-            mask = ~get_mask_from_lengths(memory_lengths)
-        else:
-            mask = None
-
-        for di in range(decoder_input.size(1)):
-            decoder_input_di = decoder_input[:, di]
-            mel_output, gate_output, attention_weights = self.decode_step(
-                decoder_input_di, memory, processed_memory, attention_hidden,
-                attention_cell, decoder_hidden, decoder_cell, attention_weights,
-                attention_weights_cum, attention_context, mask)
-
-            decoder_outputs += [mel_output]
-            gate_outputs += [gate_output]
-            alignments += [attention_weights]
-
-            # Update previous context
-            attention_context = self.attention_layer(
-                attention_hidden, memory, processed_memory,
-                attention_weights.unsqueeze(1), mask)[0]
-
-        decoder_outputs = torch.stack(decoder_outputs).transpose(0, 1)
-        gate_outputs = torch.stack(gate_outputs).transpose(0, 1)
-        alignments = torch.stack(alignments).transpose(0, 1)
-
-        return decoder_outputs, gate_outputs, alignments
+        decoder_inputs = self.parse_decoder_inputs(decoder_inputs)
+        decoder_inputs = self.prenet(decoder_inputs)
+        
+        # ... 나머지 forward 코드 ...
+        
+        mel_outputs, gate_outputs, alignments = self.parse_decoder_outputs(
+            mel_outputs, gate_outputs, alignments)
+            
+        return mel_outputs, gate_outputs, alignments
 
 class Tacotron2(nn.Module):
     # 고정된 값들을 클래스 변수로 정의

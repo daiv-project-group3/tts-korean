@@ -16,7 +16,7 @@ class Trainer:
 
         self.device = torch.device("cpu")
         if torch.cuda.is_available():
-            torch.cuda.set_device(self.config.device_num)
+            torch.cuda.set_device(self)
             self.device = torch.device("cuda")
         
         # 데이터셋 및 데이터로더 초기화
