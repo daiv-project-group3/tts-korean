@@ -4,7 +4,6 @@ from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 import numpy as np
 import torchaudio
-from jamo import hangul_to_jamo
 import librosa
 
 class KSSTTSDataset(Dataset):
@@ -32,6 +31,20 @@ class KSSTTSDataset(Dataset):
         # vocab 초기화
         self._initialize_vocab()
         
+        # Mel spectrogram 변환을 위한 transform 초기화
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=target_sr,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=80,
+            f_min=0,
+            f_max=8000,
+            power=1
+        )
+        
+        # log mel spectrogram을 위한 처리
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB()
+        
     def _initialize_vocab(self):
         all_texts = [self.dataset[idx]['original_script'] for idx in self.indices]
         unique_tokens = set()
@@ -45,14 +58,8 @@ class KSSTTSDataset(Dataset):
         self.vocab['<unk>'] = len(self.vocab)
     
     def _text_to_sequence(self, text):
-        sequence = []
-        for char in text:
-            if '가' <= char <= '힣':
-                jamos = list(hangul_to_jamo(char))
-                sequence.extend(jamos)
-            else:
-                sequence.append(char)
-        return sequence
+        # 자모 분해 없이 텍스트를 그대로 시퀀스로 변환
+        return list(text)
     
     def _wav_to_mel(self, wav):
         stft = librosa.stft(wav, n_fft=1024, hop_length=256, win_length=1024)
@@ -76,74 +83,90 @@ class KSSTTSDataset(Dataset):
         item = self.dataset[real_idx]
         
         # 텍스트 처리
-        text = item['original_script']
+        text = item['decomposed_script']
         sequence = self._text_to_sequence(text)
         sequence = [self.vocab.get(char, self.vocab['<unk>']) for char in sequence]
         sequence = torch.LongTensor(sequence)
         
         # 오디오 처리
-        audio = torch.from_numpy(item['audio']['array']).float()
-        original_sr = item['audio']['sampling_rate']
+        audio = torch.FloatTensor(item['audio']['array']).unsqueeze(0)  # [1, T]
         
-        if original_sr != self.target_sr:
-            resampler = torchaudio.transforms.Resample(
-                orig_freq=original_sr,
-                new_freq=self.target_sr
-            )
-            audio = resampler(audio)
+        # 오디오 길이 제한 (5초로 축소)
+        max_audio_length = 7 * self.target_sr
+        if audio.size(-1) > max_audio_length:
+            start = torch.randint(0, audio.size(-1) - max_audio_length, (1,))
+            audio = audio[:, start:start + max_audio_length]
         
-        # 멜 스펙트로그램 변환
-        mel = self._wav_to_mel(audio.numpy())
-        mel = torch.FloatTensor(mel).transpose(0, 1)
+        # Mel spectrogram 계산 전 오디오 다운샘플링
+        if self.target_sr > 16000:
+            audio = torchaudio.transforms.Resample(
+                self.target_sr, 16000
+            )(audio)
+            self.target_sr = 16000
+        
+        # 멜스펙트로그램 계산
+        mel = self.mel_transform(audio)  # [n_mels, T]
+        mel = self.amplitude_to_db(mel)
+        
+        # 정규화
+        mel = (mel + 80) / 80
+        
+        # print(f"Mel shape in __getitem__: {mel.shape}")
         
         return {
             'text': sequence,
-            'text_length': sequence.size(0),
-            'mel': mel,
-            'mel_length': mel.size(0),
+            'mel': mel,  # [n_mels, T] 형태로 반환
             'audio': audio
         }
 
     @staticmethod
     def collate_fn(batch):
-        # 텍스트 패딩
-        text_lengths = [x['text'].size(0) for x in batch]
-        max_text_len = max(text_lengths)
-        text_padded = torch.zeros(len(batch), max_text_len, dtype=torch.long)
+        # 텍스트 처리
+        input_lengths = [len(x['text']) for x in batch]
+        max_input_len = max(input_lengths)
+        
+        text_padded = torch.zeros(len(batch), max_input_len, dtype=torch.long)
         for i, x in enumerate(batch):
             text = x['text']
             text_padded[i, :len(text)] = text
-        
-        # 멜 스펙트로그램 패딩
-        mel_lengths = [x['mel'].size(0) for x in batch]
+
+        # 멜스펙트로그램 처리
+        mel_lengths = [x['mel'].size(-1) for x in batch]
         max_mel_len = max(mel_lengths)
+        
+        # mel_padded 차원 수정 [batch_size, n_mels, time]
         mel_padded = torch.zeros(len(batch), 80, max_mel_len)
+        gate_padded = torch.zeros(len(batch), max_mel_len)
+        
         for i, x in enumerate(batch):
             mel = x['mel']
-            mel_padded[i, :, :mel.size(0)] = mel.transpose(0, 1)
-        
-        # 오디오 패딩
-        audio_lengths = [x['audio'].size(0) for x in batch]
+            # mel의 shape 출력
+            # print(f"Mel shape before processing: {mel.shape}")
+            
+            # mel의 shape를 [batch_size, n_mels, time]으로 변경
+            if mel.dim() == 3:  # [1, 80, T]
+                mel = mel.squeeze(0)  # [80, T]
+            elif mel.dim() == 2 and mel.size(0) != 80:  # [T, 80]
+                mel = mel.transpose(0, 1)  # [80, T]
+                
+            # print(f"Mel shape after processing: {mel.shape}")
+            
+            # 패딩
+            cur_len = mel.size(1)
+            mel_padded[i, :, :cur_len] = mel
+            gate_padded[i, cur_len-1:] = 1
+
+        # 오디오 처리
+        audio_lengths = [x['audio'].size(-1) for x in batch]
         max_audio_len = max(audio_lengths)
+        
         audio_padded = torch.zeros(len(batch), 1, max_audio_len)
         for i, x in enumerate(batch):
             audio = x['audio']
-            audio_padded[i, 0, :audio.size(0)] = audio
-        
-        # gate 패딩 생성
-        gate_padded = torch.zeros(len(batch), max_mel_len)
-        for i, length in enumerate(mel_lengths):
-            gate_padded[i, length-1:] = 1
-        
-        # 길이 정보도 함께 반환
-        text_lengths = torch.LongTensor(text_lengths)
-        mel_lengths = torch.LongTensor(mel_lengths)
-        
-        return {
-            'text_padded': text_padded,
-            'mel_padded': mel_padded,
-            'gate_padded': gate_padded,
-            'audio_padded': audio_padded,
-            'text_lengths': text_lengths,
-            'mel_lengths': mel_lengths
-        }
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            audio_padded[i, :, :audio.size(-1)] = audio
+
+        return (text_padded, torch.LongTensor(input_lengths),
+                mel_padded, gate_padded, torch.LongTensor(mel_lengths),
+                audio_padded)

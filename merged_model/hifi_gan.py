@@ -3,115 +3,88 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm, spectral_norm
 
+def get_padding(kernel_size, dilation=1):
+    return int((kernel_size*dilation - dilation)/2)
+
 class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dilation=1, negative_slope=0.01):
+    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
         super().__init__()
-        # 패딩 계산을 동적으로 수행
-        self.padding = (dilation * (kernel_size - 1)) // 2
-        
-        self.conv1 = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=self.padding, dilation=dilation
-        )
-        self.conv2 = nn.Conv1d(
-            out_channels, out_channels, kernel_size,
-            stride=stride, padding=self.padding, dilation=dilation
-        )
-        self.leaky_relu = nn.LeakyReLU(negative_slope=negative_slope)
-        self.skip_connection = (
-            nn.Conv1d(in_channels, out_channels, 1)
-            if in_channels != out_channels else
-            nn.Identity()
-        )
+        self.convs1 = nn.ModuleList([
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
+                                padding=get_padding(kernel_size, dilation[0]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
+                                padding=get_padding(kernel_size, dilation[1]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
+                                padding=get_padding(kernel_size, dilation[2])))
+        ])
+        self.convs2 = nn.ModuleList([
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                                padding=get_padding(kernel_size, 1)))
+            for _ in range(3)
+        ])
 
     def forward(self, x):
-        residual = self.skip_connection(x)
-        x = self.leaky_relu(self.conv1(x))
-        x = self.conv2(x)
-        
-        # 차원이 다른 경우 residual을 조정
-        if x.size(-1) != residual.size(-1):
-            # 더 작은 크기에 맞춤
-            target_size = min(x.size(-1), residual.size(-1))
-            x = x[..., :target_size]
-            residual = residual[..., :target_size]
-            
-        return self.leaky_relu(x + residual)
+        for c1, c2 in zip(self.convs1, self.convs2):
+            xt = F.leaky_relu(x, 0.1)
+            xt = c1(xt)
+            xt = F.leaky_relu(xt, 0.1)
+            xt = c2(xt)
+            x = xt + x
+        return x
 
 class Generator(nn.Module):
     def __init__(self, input_size=80):
         super().__init__()
-        # Initial conv
-        self.conv_pre = nn.Conv1d(input_size, 512, 7, 1, 3)
+        self.input_size = input_size
         
-        # Upsampling layers with kernel size and stride adjustments
+        # Initial conv layer with matching input channels
+        self.conv_pre = weight_norm(nn.Conv1d(input_size, 256, 7, 1, 3))
+        
+        # Upsampling layers with proper channel sizes
         self.ups = nn.ModuleList([
-            nn.ConvTranspose1d(512, 256, 16, 8, 4),
-            nn.ConvTranspose1d(256, 128, 16, 8, 4),
-            nn.ConvTranspose1d(128, 64, 4, 2, 1),
-            nn.ConvTranspose1d(64, 32, 4, 2, 1),
+            weight_norm(nn.ConvTranspose1d(256, 128, 16, 8, 4)),
+            weight_norm(nn.ConvTranspose1d(128, 64, 16, 8, 4)),
+            weight_norm(nn.ConvTranspose1d(64, 32, 4, 2, 1)),
+            weight_norm(nn.ConvTranspose1d(32, 16, 4, 2, 1)),
         ])
         
-        # Multi-Receptive Field Fusion
-        self.mrf_blocks = nn.ModuleList([
-            # First MRF block
+        # Residual blocks with matching channel sizes
+        self.resblocks = nn.ModuleList([
             nn.ModuleList([
-                ResBlock(256, 256, kernel_size=3, dilation=1),
-                ResBlock(256, 256, kernel_size=3, dilation=3),
-                ResBlock(256, 256, kernel_size=3, dilation=5)
+                ResBlock(128, kernel_size=3, dilation=(1, 3, 5))
+                for _ in range(3)
             ]),
-            # Second MRF block
             nn.ModuleList([
-                ResBlock(128, 128, kernel_size=3, dilation=1),
-                ResBlock(128, 128, kernel_size=3, dilation=3),
-                ResBlock(128, 128, kernel_size=3, dilation=5)
+                ResBlock(64, kernel_size=3, dilation=(1, 3, 5))
+                for _ in range(2)
             ]),
-            # Third MRF block
             nn.ModuleList([
-                ResBlock(64, 64, kernel_size=3, dilation=1),
-                ResBlock(64, 64, kernel_size=3, dilation=3)
+                ResBlock(32, kernel_size=3, dilation=(1, 3, 5))
+                for _ in range(2)
             ]),
-            # Fourth MRF block
             nn.ModuleList([
-                ResBlock(32, 32, kernel_size=3, dilation=1),
-                ResBlock(32, 32, kernel_size=3, dilation=2)
-            ])
+                ResBlock(16, kernel_size=3, dilation=(1, 3, 5))
+            ]),
         ])
         
-        # Final conv
-        self.conv_post = nn.Conv1d(32, 1, 7, 1, 3)
-        self.leaky_relu = nn.LeakyReLU(0.1)
+        # Final conv layer
+        self.conv_post = weight_norm(nn.Conv1d(16, 1, 7, 1, 3))
+        self.tanh = nn.Tanh()
 
     def forward(self, x):
-        print(f"Generator input shape: {x.shape}")
+        # Initial conv
         x = self.conv_pre(x)
-        print(f"After conv_pre: {x.shape}")
         
-        for i in range(len(self.ups)):
-            x = self.leaky_relu(x)
-            x = self.ups[i](x)
-            print(f"After up {i}: {x.shape}")
-            
-            # Apply MRF blocks
-            xs = None
-            for j, resblock in enumerate(self.mrf_blocks[i]):
-                if xs is None:
-                    xs = resblock(x)
-                else:
-                    # 크기가 다른 경우 처리
-                    res_out = resblock(x)
-                    if res_out.size(-1) != xs.size(-1):
-                        target_size = min(res_out.size(-1), xs.size(-1))
-                        xs = xs[..., :target_size]
-                        res_out = res_out[..., :target_size]
-                    xs += res_out
-            x = xs / len(self.mrf_blocks[i])
+        # Upsampling and residual blocks
+        for up, res_blocks in zip(self.ups, self.resblocks):
+            x = up(x)
+            x = F.leaky_relu(x, 0.1)
+            for res in res_blocks:
+                x = res(x)
         
-        print(f"Generator output shape: {x.shape}")
-        x = self.leaky_relu(x)
+        # Final conv
         x = self.conv_post(x)
-        x = torch.tanh(x)
-        
+        x = self.tanh(x)
         return x
 
 class MultiScaleDiscriminator(nn.Module):
@@ -127,21 +100,24 @@ class MultiScaleDiscriminator(nn.Module):
             nn.AvgPool1d(4, 2, padding=2)
         ])
 
-    def forward(self, x):
-        """
-        x: 입력 오디오 (fake 또는 real)
-        """
-        y_d_rs = []  # discriminator outputs
-        fmap_rs = []  # feature maps
+    def forward(self, y, y_hat):
+        y_d_rs = []  # real outputs
+        y_d_gs = []  # generated outputs
+        fmap_rs = []  # real features
+        fmap_gs = []  # generated features
 
         for i, d in enumerate(self.discriminators):
             if i != 0:
-                x = self.meanpools[i-1](x)
-            y_d_r, fmap_r = d(x)
+                y = self.meanpools[i-1](y)
+                y_hat = self.meanpools[i-1](y_hat)
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
             fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
 
-        return y_d_rs, fmap_rs
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 class DiscriminatorS(nn.Module):
     def __init__(self, use_spectral_norm=False):
@@ -180,83 +156,79 @@ class MultiPeriodDiscriminator(nn.Module):
             DiscriminatorP(11),
         ])
 
-    def forward(self, x):
-        """
-        x: 입력 오디오 (fake 또는 real)
-        """
-        y_d_rs = []  # discriminator outputs
-        fmap_rs = []  # feature maps
+    def forward(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
 
         for d in self.discriminators:
-            y_d_r, fmap_r = d(x)
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
             y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
             fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
 
-        return y_d_rs, fmap_rs
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 class MRFDiscriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, resolutions=[(1024, 120, 600), (2048, 240, 1200), (4096, 480, 2400)]):
         super().__init__()
-        # 초기 채널 조정을 위한 Conv1d 레이어들
-        self.msd_adjust = nn.Conv1d(1, 64, kernel_size=3, padding=1)
-        
-        # MPD feature를 위한 2D -> 1D 변환 레이어
-        self.mpd_adjust = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=(3, 3), padding=(1, 1)),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(32, 64, kernel_size=(3, 3), padding=(1, 1)),
-            nn.LeakyReLU(0.1)
-        )
-        
-        # 공통 처리를 위한 레이어들
-        self.shared_conv = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1),
-            nn.Conv1d(512, 512, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1)
-        )
-        
-        # 최종 출력을 위한 레이어
-        self.output_layer = nn.Conv1d(512, 1, kernel_size=3, padding=1)
+        self.discriminators = nn.ModuleList([
+            MRFSubDiscriminator(resolution) for resolution in resolutions
+        ])
 
-    def forward(self, msd_features, mpd_features):
-        """
-        Args:
-            msd_features: List[List[Tensor]] - MultiScaleDiscriminator의 feature maps
-            mpd_features: List[List[Tensor]] - MultiPeriodDiscriminator의 feature maps
-        """
-        # 마지막 레이어의 feature map 사용
-        msd_feat = msd_features[-1][-1]  # [B, 1, T]
-        mpd_feat = mpd_features[-1][-1]  # [B, 1, H, W]
+    def forward(self, y, y_hat):
+        real_outputs = []
+        fake_outputs = []
+        real_fmaps = []
+        fake_fmaps = []
+
+        for disc in self.discriminators:
+            r_out, r_fmap = disc(y)
+            f_out, f_fmap = disc(y_hat)
+            
+            real_outputs.append(r_out)
+            fake_outputs.append(f_out)
+            real_fmaps.append(r_fmap)
+            fake_fmaps.append(f_fmap)
+
+        return real_outputs, fake_outputs, real_fmaps, fake_fmaps
+
+class MRFSubDiscriminator(nn.Module):
+    def __init__(self, resolution):
+        super().__init__()
+        self.resolution = resolution
+        kernel_size, stride, padding = resolution
         
-        # MPD feature 처리
-        if mpd_feat.dim() == 4:
-            B, C, H, W = mpd_feat.size()
-            # 2D 처리
-            mpd_processed = self.mpd_adjust(mpd_feat)  # [B, 64, H, W]
-            # Flatten H, W 차원
-            mpd_processed = mpd_processed.view(B, 64, -1)  # [B, 64, H*W]
+        # FDCNN (Frequency-Discriminative Convolutional Neural Network)
+        self.layers = nn.ModuleList([
+            weight_norm(nn.Conv1d(1, 32, kernel_size, stride=stride, padding=padding)),
+            weight_norm(nn.Conv1d(32, 64, kernel_size=41, stride=4, padding=20, groups=4)),
+            weight_norm(nn.Conv1d(64, 128, kernel_size=41, stride=4, padding=20, groups=16)),
+            weight_norm(nn.Conv1d(128, 256, kernel_size=41, stride=4, padding=20, groups=16)),
+            weight_norm(nn.Conv1d(256, 512, kernel_size=41, stride=4, padding=20, groups=32)),
+            weight_norm(nn.Conv1d(512, 1024, kernel_size=41, stride=4, padding=20, groups=32)),
+            weight_norm(nn.Conv1d(1024, 1024, kernel_size=5, stride=1, padding=2)),
+            weight_norm(nn.Conv1d(1024, 1, kernel_size=3, stride=1, padding=1)),
+        ])
         
-        # MSD feature 처리
-        msd_processed = self.msd_adjust(msd_feat)  # [B, 64, T]
+        self.activations = nn.ModuleList([
+            nn.LeakyReLU(0.2, True) for _ in range(len(self.layers) - 1)
+        ])
+
+    def forward(self, x):
+        feature_maps = []
         
-        # 시간 차원 맞추기
-        target_length = min(msd_processed.size(-1), mpd_processed.size(-1))
-        msd_processed = F.interpolate(msd_processed, size=target_length, mode='linear', align_corners=False)
-        mpd_processed = F.interpolate(mpd_processed, size=target_length, mode='linear', align_corners=False)
+        for i, (layer, activation) in enumerate(zip(self.layers[:-1], self.activations)):
+            x = layer(x)
+            x = activation(x)
+            feature_maps.append(x)
         
-        # Feature map 결합
-        combined = torch.cat([msd_processed, mpd_processed], dim=1)  # [B, 128, T]
+        x = self.layers[-1](x)
         
-        # 공통 처리
-        x = self.shared_conv(combined)
-        
-        # 최종 출력
-        output = self.output_layer(x)
-        
-        return output
+        return x, feature_maps
 
 class DiscriminatorP(nn.Module):
     def __init__(self, period):
@@ -296,3 +268,58 @@ class DiscriminatorP(nn.Module):
         x = torch.flatten(x, 1, -1)
 
         return x, fmap
+
+class DiscriminatorR(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.convs = nn.ModuleList([
+            weight_norm(nn.Conv1d(1, 128, 3, 1, padding=1)),
+            weight_norm(nn.Conv1d(128, 256, 3, 2, padding=1)),
+            weight_norm(nn.Conv1d(256, 512, 3, 2, padding=1)),
+            weight_norm(nn.Conv1d(512, 1024, 3, 2, padding=1)),
+            weight_norm(nn.Conv1d(1024, 1024, 3, 1, padding=1)),
+        ])
+        self.conv_post = weight_norm(nn.Conv1d(1024, 1, 3, 1, padding=1))
+
+    def forward(self, x):
+        fmap = []
+        for l in self.convs:
+            x = l(x)
+            x = F.leaky_relu(x, 0.1)
+            fmap.append(x)
+        x = self.conv_post(x)
+        fmap.append(x)
+        x = torch.flatten(x, 1, -1)
+        return x, fmap
+
+class MultiResolutionFourierDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.discriminators = nn.ModuleList([
+            DiscriminatorR(),
+            DiscriminatorR(),
+            DiscriminatorR(),
+        ])
+        self.meanpools = nn.ModuleList([
+            nn.AvgPool1d(4, 2, padding=2),
+            nn.AvgPool1d(4, 2, padding=2)
+        ])
+
+    def forward(self, y, y_hat):
+        y_d_rs = []
+        y_d_gs = []
+        fmap_rs = []
+        fmap_gs = []
+
+        for i, d in enumerate(self.discriminators):
+            if i != 0:
+                y = self.meanpools[i-1](y)
+                y_hat = self.meanpools[i-1](y_hat)
+            y_d_r, fmap_r = d(y)
+            y_d_g, fmap_g = d(y_hat)
+            y_d_rs.append(y_d_r)
+            y_d_gs.append(y_d_g)
+            fmap_rs.append(fmap_r)
+            fmap_gs.append(fmap_g)
+
+        return y_d_rs, y_d_gs, fmap_rs, fmap_gs

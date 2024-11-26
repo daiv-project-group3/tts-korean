@@ -29,40 +29,64 @@ class TTSLoss(nn.Module):
             normalized=True
         ).to(device)
 
-    def tacotron2_loss(self, mel_output, mel_output_postnet, gate_out, 
-                      mel_target, gate_target, mel_lengths):
-        """Tacotron2 Loss Calculation"""
-        # mel_target: [B, n_mel_channels, T]
-        # mel_output: [B, T, n_mel_channels]
+    def get_mask_from_lengths(self, lengths):
+        """
+        lengths 텐서로부터 마스크를 생성합니다.
         
-        # 차원 맞추기
-        mel_target = mel_target.transpose(1, 2)  # [B, T, n_mel_channels]
+        Args:
+            lengths (Tensor): shape [B] 배치의 각 시퀀스 길이
+            
+        Returns:
+            Tensor: shape [B, T] 마스크 (True = 유효한 위치, False = 패딩 위치)
+        """
+        max_len = torch.max(lengths).item()
+        batch_size = lengths.size(0)
         
-        # gate_out 차원 조정 [B, T, 1] -> [B, T]
-        gate_out = gate_out.squeeze(-1)
+        # [B, T] 크기의 인덱스 그리드 생성
+        ids = torch.arange(0, max_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
         
-        # 텐서 차원 확인
-        B, T, C = mel_target.size()  # [batch_size, time_steps, n_mel_channels]
+        # lengths를 [B, 1] 형태로 확장하여 broadcasting 가능하게 함
+        mask = ids < lengths.unsqueeze(1)
         
-        # 마스크 생성 (B, T)
+        return mask
+        
+    def tacotron2_loss(self, mel_out, mel_out_postnet, gate_out, mel_target, gate_target, mel_lengths):
+        # mel_target과 mel_out의 shape 확인
+        B, T, C = mel_out.size()
+        target_T = mel_target.size(2)
+        
+        # Adjust target length if necessary
+        if T > target_T:
+            mel_out = mel_out[:, :target_T, :]
+            mel_out_postnet = mel_out_postnet[:, :target_T, :]
+            gate_out = gate_out[:, :target_T]
+        elif T < target_T:
+            # Pad outputs if they're shorter than target
+            mel_out = F.pad(mel_out, (0, 0, 0, target_T - T))
+            mel_out_postnet = F.pad(mel_out_postnet, (0, 0, 0, target_T - T))
+            gate_out = F.pad(gate_out, (0, target_T - T))
+        
+        # Transpose mel_target to match output shape
+        mel_target = mel_target.transpose(1, 2)
+        
+        # Create mask based on lengths
         mask = ~self.get_mask_from_lengths(mel_lengths)
+        mask = mask.unsqueeze(-1).expand(-1, -1, mel_target.size(-1))
         
-        # 마스크를 멜 스펙트로그램 차원에 맞게 조정
-        mel_mask = mask.unsqueeze(-1).expand(-1, -1, C)  # [B, T, C]
+        # Apply mask
+        mel_target_masked = mel_target.masked_fill(mask, 0)
+        mel_out_masked = mel_out.masked_fill(mask, 0)
+        mel_out_postnet_masked = mel_out_postnet.masked_fill(mask, 0)
         
-        # 마스킹 적용
-        mel_target_masked = mel_target.masked_fill(mel_mask, 0)
-        mel_output_masked = mel_output.masked_fill(mel_mask, 0)
-        mel_output_postnet_masked = mel_output_postnet.masked_fill(mel_mask, 0)
+        # Calculate losses
+        mel_loss = F.mse_loss(mel_out_masked, mel_target_masked) + \
+                   F.mse_loss(mel_out_postnet_masked, mel_target_masked)
         
-        # gate에 대한 마스킹 적용
-        gate_target = gate_target.masked_fill(mask, 0)
-        gate_out = gate_out.masked_fill(mask, 0)
-        
-        # Loss 계산
-        mel_loss = self.l1_loss(mel_output_masked, mel_target_masked) + \
-                  self.l1_loss(mel_output_postnet_masked, mel_target_masked)
-        gate_loss = self.bce_loss(gate_out, gate_target)
+        # Gate loss
+        gate_target = gate_target[:, :mel_out.size(1)]
+        gate_target = gate_target.view(-1, 1)
+        gate_out = gate_out.view(-1, 1)
+        gate_loss = F.binary_cross_entropy_with_logits(gate_out, gate_target)
         
         return {
             'mel_loss': mel_loss,
@@ -82,10 +106,10 @@ class TTSLoss(nn.Module):
         fake_mel = self.mel_transform(fake_wave)
         
         # 디버깅을 위한 shape 출력
-        print(f"Real wave shape: {real_wave.shape}")
-        print(f"Fake wave shape: {fake_wave.shape}")
-        print(f"Real mel shape: {real_mel.shape}")
-        print(f"Fake mel shape: {fake_mel.shape}")
+        # print(f"Real wave shape: {real_wave.shape}")
+        # print(f"Fake wave shape: {fake_wave.shape}")
+        # print(f"Real mel shape: {real_mel.shape}")
+        # print(f"Fake mel shape: {fake_mel.shape}")
         
         return self.l1_loss(fake_mel, real_mel) * self.lambda_mel
 
@@ -110,58 +134,55 @@ class TTSLoss(nn.Module):
 
     def generator_loss(self, disc_outputs):
         loss = 0
-        for dg in disc_outputs:
-            loss += torch.mean((1-dg)**2)
+        for disc_output_group in disc_outputs:
+            if isinstance(disc_output_group, (list, tuple)):
+                # 리스트인 경우 각 요소에 대해 처리
+                for dg in disc_output_group:
+                    if isinstance(dg, torch.Tensor):
+                        loss += torch.mean((1-dg)**2)
+            elif isinstance(disc_output_group, torch.Tensor):
+                # 텐서인 경우 직접 처리
+                loss += torch.mean((1-disc_output_group)**2)
         return loss
 
     def discriminator_loss(self, disc_real_outputs, disc_generated_outputs):
         loss = 0
-        for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-            r_loss = torch.mean((1-dr)**2)
-            g_loss = torch.mean(dg**2)
-            loss += (r_loss + g_loss)
+        for dr_group, dg_group in zip(disc_real_outputs, disc_generated_outputs):
+            if isinstance(dr_group, (list, tuple)) and isinstance(dg_group, (list, tuple)):
+                # 리스트인 경우 각 요소에 대해 처리
+                for dr, dg in zip(dr_group, dg_group):
+                    if isinstance(dr, torch.Tensor) and isinstance(dg, torch.Tensor):
+                        r_loss = torch.mean((1-dr)**2)
+                        g_loss = torch.mean(dg**2)
+                        loss += (r_loss + g_loss)
+            elif isinstance(dr_group, torch.Tensor) and isinstance(dg_group, torch.Tensor):
+                # 텐서인 경우 직접 처리
+                r_loss = torch.mean((1-dr_group)**2)
+                g_loss = torch.mean(dg_group**2)
+                loss += (r_loss + g_loss)
         return loss
 
     def hifi_gan_loss(self, real_wave, fake_wave, real_outputs, fake_outputs, real_feats, fake_feats):
-        """HiFi-GAN Total Loss Calculation"""
-        # 차원 확인 및 조정
-        if real_wave.dim() == 2:
-            real_wave = real_wave.unsqueeze(1)
-        if fake_wave.dim() == 2:
-            fake_wave = fake_wave.unsqueeze(1)
+        # 더 작은 크기의 feature matching
+        fm_loss = self.feature_matching_loss(
+            real_feats[:2],  # 처음 2개의 discriminator feature만 사용
+            fake_feats[:2]
+        )
         
-        # 길이 맞추기
-        min_length = min(real_wave.size(-1), fake_wave.size(-1))
-        real_wave = real_wave[..., :min_length]
-        fake_wave = fake_wave[..., :min_length]
-        
-        # 디버깅을 위한 shape 출력
-        print(f"\nFeature matching shapes:")
-        print(f"Real features length: {[[(f.shape) for f in disc] for disc in real_feats]}")
-        print(f"Fake features length: {[[(f.shape) for f in disc] for disc in fake_feats]}")
-        
-        # Loss 계산
+        # Loss 계산 최적화
         mel_loss = self.mel_spectrogram_loss(real_wave, fake_wave)
-        fm_loss = self.feature_matching_loss(real_feats, fake_feats)
         gen_loss = self.generator_loss(fake_outputs)
         disc_loss = self.discriminator_loss(real_outputs, fake_outputs)
         
-        # Total losses
-        g_loss = mel_loss + fm_loss + gen_loss
-        d_loss = disc_loss
+        # 메모리 해제
+        del real_feats, fake_feats
+        torch.cuda.empty_cache()
         
         return {
-            'generator_loss': g_loss,
-            'discriminator_loss': d_loss,
+            'generator_loss': mel_loss + fm_loss + gen_loss,
+            'discriminator_loss': disc_loss,
             'mel_loss': mel_loss,
             'feature_matching_loss': fm_loss,
             'adversarial_loss_g': gen_loss,
             'adversarial_loss_d': disc_loss
         }
-
-    @staticmethod
-    def get_mask_from_lengths(lengths):
-        max_len = torch.max(lengths).item()
-        ids = torch.arange(0, max_len, device=lengths.device)
-        mask = (ids < lengths.unsqueeze(1)).bool()
-        return mask
